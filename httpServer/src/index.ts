@@ -8,6 +8,12 @@ import { TriggerValuesController } from './Controllers/TriggerValuesController';
 import { PressureValuesController } from './Controllers/PressureValuesController';
 import { BreathsPerMinuteValuesController } from './Controllers/BreathsPerMinuteValuesController';
 import * as fs from 'fs';
+// eslint-disable-next-line no-unused-vars
+import { ISettingsRepository } from './Repositories/ISettingsRepository';
+import { TestSettingsRepository } from './Repositories/TestSettingsRepository';
+import { MongoSettingsRepository } from './Repositories/MongoSettingsRepository';
+import { SettingsController } from './Controllers/SettingsController';
+import { MongoClient } from 'mongodb';
 
 /* define configuration */
 
@@ -25,13 +31,32 @@ console.log(environment);
 const host = environment.ListenInterface;
 const port = environment.Port;
 
-const repositoryFactory = function(): IValuesRepository {
+let mongoClient: MongoClient;
+if (environment.RepositoryMode !== 'test') {
+    const connectionString = `mongodb://${environment.DatabaseHost}:${environment.DatabasePort}/`;
+    mongoClient = new MongoClient(connectionString, { useUnifiedTopology: true });
+}
+
+const valuesRepositoryFactory = function(): IValuesRepository {
     let repository: IValuesRepository = null;
 
     if (environment.RepositoryMode === 'test') {
         repository = new TestRepository();
     } else {
-        repository = new MongoValuesRepository(`mongodb://${environment.DatabaseHost}:${environment.DatabasePort}/`);
+        repository = new MongoValuesRepository(mongoClient);
+    }
+
+    return repository;
+};
+
+const testSettingsRepository = new TestSettingsRepository();
+const settingsRepositoryFactory = function(): ISettingsRepository {
+    let repository: ISettingsRepository = null;
+
+    if (environment.RepositoryMode === 'test') {
+        repository = testSettingsRepository;
+    } else {
+        repository = new MongoSettingsRepository(mongoClient);
     }
 
     return repository;
@@ -63,28 +88,65 @@ const start = async function () {
     server.route({
         method: 'GET',
         path: '/api/volume_values',
-        handler: (request: Hapi.Request, h: Hapi.ResponseToolkit) => new VolumeValuesController(repositoryFactory()).HandleGet(request, h),
+        handler: (request: Hapi.Request, h: Hapi.ResponseToolkit) => new VolumeValuesController(valuesRepositoryFactory()).HandleGet(request, h),
     });
 
     server.route({
         method: 'GET',
         path: '/api/pressure_values',
-        handler: (request: Hapi.Request, h: Hapi.ResponseToolkit) => new PressureValuesController(repositoryFactory()).HandleGet(request, h),
+        handler: (request: Hapi.Request, h: Hapi.ResponseToolkit) => new PressureValuesController(valuesRepositoryFactory()).HandleGet(request, h),
     });
 
     server.route({
         method: 'GET',
         path: '/api/breathsperminute_values',
-        handler: (request: Hapi.Request, h: Hapi.ResponseToolkit) => new BreathsPerMinuteValuesController(repositoryFactory()).HandleGet(request, h),
+        handler: (request: Hapi.Request, h: Hapi.ResponseToolkit) => new BreathsPerMinuteValuesController(valuesRepositoryFactory()).HandleGet(request, h),
     });
 
     server.route({
         method: 'GET',
         path: '/api/trigger_values',
-        handler: (request: Hapi.Request, h: Hapi.ResponseToolkit) => new TriggerValuesController(repositoryFactory()).HandleGet(request, h),
+        handler: (request: Hapi.Request, h: Hapi.ResponseToolkit) => new TriggerValuesController(valuesRepositoryFactory()).HandleGet(request, h),
+    });
+
+    const broadcastSettings = (settings: any): void => {
+        server.publish('/api/settings', settings);
+    };
+
+    server.route({
+        method: 'GET',
+        path: '/api/settings',
+        handler: async (request: Hapi.Request, h: Hapi.ResponseToolkit) => await new SettingsController(settingsRepositoryFactory(), broadcastSettings).HandleGet(request, h),
+    });
+
+    server.route({
+        method: 'PUT',
+        path: '/api/settings',
+        handler: async (request: Hapi.Request, h: Hapi.ResponseToolkit) => await new SettingsController(settingsRepositoryFactory(), broadcastSettings).HandlePut(request, h),
     });
 
     await server.start();
+
+    // start sending updates over websocket
+    const now = new Date();
+    const lastDateTime = {
+        volume_values: now,
+        pressure_values: now,
+        breathsperminute_values: now,
+        trigger_values: now,
+    };
+    const valuesRepository = valuesRepositoryFactory();
+
+    setInterval(async () => {
+        for (const key in lastDateTime) {
+            const newValues = await valuesRepository.ReadValues(key, lastDateTime[key]);
+
+            if (newValues.length > 0) {
+                server.publish(`/api/${key}`, newValues);
+                lastDateTime[key] = newValues[newValues.length - 1].loggedAt;
+            }
+        };
+    }, environment.UpdateRate);
 };
 
 start();
